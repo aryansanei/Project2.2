@@ -1,5 +1,4 @@
 #include <assert.h>
-#include <limits.h>
 #include <signal.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -11,253 +10,204 @@
 #include "uthread.h"
 #include "queue.h"
 
-// All possible thread states.
-#define READY 0
-#define RUNNING 1
-#define BLOCKED 2
-#define ZOMBIE 3
-
-// Queued threads to be dealt with.
-static queue_t ready_processes;
-static queue_t zombie_processes;
-static queue_t blocked_processes;
-
-static struct uthread *running;
-
-// Initial conditions: preemption disabled, no instantiated threads.
-static int preempt_required = 0;
-static uthread_t num_processes = 0;
-
-struct uthread {
-    uthread_t tid;
-    int tid_blocking;
-    uthread_ctx_t *context;
-    int state;
-    void *stack;
-    int already_joined;
+/* Thread states */
+enum {
+    READY,
+    RUNNING,
+    BLOCKED,
+    EXITED
 };
 
-static int manage_thread_library(struct uthread **myThread, int is_main) {
-    *myThread = (struct uthread *)malloc(sizeof(struct uthread));
-    if (!*myThread) {
-        if (is_main) {
-            queue_destroy(zombie_processes);
-            queue_destroy(ready_processes);
-        }
+struct uthread_tcb {
+    uthread_ctx_t context;     /* Thread context */
+    void *stack;               /* Thread stack */
+    int state;                 /* Thread state */
+};
 
-        return EXIT_FAILURE;
-    }
+/* Ready queue and pointer to currently running thread */
+static queue_t ready_queue;
+static struct uthread_tcb *running_thread;
+static struct uthread_tcb *idle_thread;
 
-    (*myThread)->context = (ucontext_t *)malloc(sizeof(ucontext_t));
-    if (!(*myThread)->context) {
-        if (is_main) {
-            queue_destroy(ready_processes);
-            queue_destroy(zombie_processes);
-        }
-        free(*myThread);
-
-        return EXIT_FAILURE;
-    }
-
-    (*myThread)->tid = num_processes;
-    (*myThread)->state = is_main ? RUNNING : READY;
-    (*myThread)->stack = NULL;
-    (*myThread)->tid_blocking = -1;
-
-    return EXIT_SUCCESS;
+struct uthread_tcb *uthread_current(void)
+{
+    return running_thread;
 }
 
-int uthread_start(int preempt)
+static void uthread_schedule(void)
 {
-    ready_processes = queue_create();
-    if (!ready_processes) {
-        return -1;
+    struct uthread_tcb *prev_thread = running_thread;
+    struct uthread_tcb *next_thread;
+
+    /* Get next thread from ready queue */
+    if (queue_dequeue(ready_queue, (void**)&next_thread) < 0) {
+        /* No more threads to run, back to idle thread */
+        next_thread = idle_thread;
     }
 
-    zombie_processes = queue_create();
-    if (!zombie_processes) {
-        queue_destroy(ready_processes);
-        return -1;
-    }
+    /* Update thread states */
+    running_thread = next_thread;
+    running_thread->state = RUNNING;
 
-    blocked_processes = queue_create();
-    if (!blocked_processes) {
-        queue_destroy(ready_processes);
-        queue_destroy(zombie_processes);
-        return -1;
-    }
-
-    if (manage_thread_library(&running, 1)) {
-        return -1;
-    }
-
-    if (preempt) {
-        preempt_required = preempt;
-        preempt_start();
-    }
-
-    return 0;
-}
-
-int uthread_create(uthread_func_t func, void *arg)
-{
-    preempt_disable();
-
-    if (num_processes >= USHRT_MAX) {
-        return -1;
-    }
-
-    num_processes++;
-    struct uthread *myThread = NULL;
-    if (manage_thread_library(&myThread, 0)) {
-        num_processes--;
-        return -1;
-    }
-
-    myThread->stack = uthread_ctx_alloc_stack();
-    if (!myThread->stack) {
-        free(myThread->context);
-        free(myThread);
-        return -1;
-    }
-
-    int context_init_error = uthread_ctx_init(myThread->context, myThread->stack, func);
-    if (context_init_error) {
-        uthread_ctx_destroy_stack(myThread->stack);
-        free(myThread->context);
-        free(myThread);
-        return -1;
-    }
-
-    preempt_disable();
-
-    if (queue_enqueue(ready_processes, (void *)myThread) == -1) {
-        uthread_ctx_destroy_stack(myThread->stack);
-        free(myThread->context);
-        free(myThread);
-        return -1;
-    }
-
-    preempt_enable();
-
-    return myThread->tid;
-}
-
-static void uthread_destroy(struct uthread *myThread)
-{
-    if (myThread->stack) {
-        uthread_ctx_destroy_stack(myThread->stack);
-    }
-    free(myThread->context);
-    free(myThread);
+    /* Switch context to next thread */
+    uthread_ctx_switch(&prev_thread->context, &next_thread->context);
 }
 
 void uthread_yield(void)
 {
+    /* Disable preemption during scheduling operation */
     preempt_disable();
 
-    if (running->state == RUNNING) {
-        running->state = READY;
-        queue_enqueue(ready_processes, (void *)running);
-    } else if (running->state == BLOCKED) {
-        queue_enqueue(blocked_processes, (void *)running);
+    /* Put current thread back in ready queue if not idle and not exited */
+    if (running_thread != idle_thread && running_thread->state != EXITED) {
+        running_thread->state = READY;
+        queue_enqueue(ready_queue, running_thread);
     }
 
-    struct uthread *current_process = running;
-    queue_dequeue(ready_processes, (void **)&running);
-    running->state = RUNNING;
-    uthread_ctx_switch(current_process->context, running->context);
+    /* Schedule next thread */
+    uthread_schedule();
 
+    /* Re-enable preemption */
     preempt_enable();
-}
-
-uthread_t uthread_self(void)
-{
-    return running->tid;
-}
-
-static int find_tid(queue_t q, void *data, void *arg)
-{
-    struct uthread *a = (struct uthread *)data;
-    uthread_t match = (uthread_t)(long)arg;
-    (void)q;
-
-    if (a->tid == match)
-        return 1;
-
-    return 0;
-}
-
-int uthread_stop(void)
-{
-    if (running->tid != 0) {
-        return -1;
-    }
-
-    if (queue_length(ready_processes) != 0 && queue_length(zombie_processes) != 0) {
-        return -1;
-    }
-
-    while (queue_length(zombie_processes) > 0) {
-        struct uthread *myThread;
-
-        preempt_disable();
-        queue_dequeue(zombie_processes, (void **)&myThread);
-        preempt_enable();
-
-        uthread_destroy(myThread);
-    }
-
-    queue_destroy(ready_processes);
-    queue_destroy(zombie_processes);
-    queue_destroy(blocked_processes);
-    uthread_destroy(running);
-
-    if (preempt_required) {
-        preempt_stop();
-    }
-
-    return 0;
 }
 
 void uthread_exit(void)
 {
+    /* Disable preemption during exit */
     preempt_disable();
-    if (running->tid_blocking != -1) {
-        struct uthread *blocked = NULL;
-        queue_iterate(blocked_processes, find_tid, (void *)(size_t)running->tid_blocking, (void **)&blocked);
 
-        blocked->state = READY;
-        queue_delete(blocked_processes, blocked);
-        queue_enqueue(ready_processes, (void *)blocked);
+    /* Mark thread as exited */
+    running_thread->state = EXITED;
+
+    /* Free thread resources - the stack will be freed here */
+    if (running_thread != idle_thread) {
+        uthread_ctx_destroy_stack(running_thread->stack);
+        /* We don't free the TCB yet since we're still using its context */
     }
 
-    running->state = ZOMBIE;
-    queue_enqueue(zombie_processes, (void *)running);
+    /* Schedule next thread */
+    uthread_schedule();
 
-    uthread_yield();
+    /* This point should never be reached */
+    fprintf(stderr, "Error: uthread_exit reached end\n");
+    exit(1);
 }
 
-int uthread_join(uthread_t tid, int *retval)
+int uthread_create(uthread_func_t func, void *arg)
 {
-    (void)retval;
+    struct uthread_tcb *tcb;
 
-    struct uthread *tbj = NULL;
+    /* Disable preemption during thread creation */
+    preempt_disable();
 
-    queue_iterate(ready_processes, find_tid, (void *)(size_t)tid, (void **)&tbj);
-    queue_iterate(zombie_processes, find_tid, (void *)(size_t)tid, (void **)&tbj);
-
-    if (tid == 0 || running->tid == tid || tbj == NULL || tbj->already_joined) {
+    /* Allocate TCB */
+    tcb = malloc(sizeof(struct uthread_tcb));
+    if (tcb == NULL) {
+        preempt_enable();
         return -1;
     }
 
-    tbj->already_joined = 1;
-
-    if (tbj->state == READY) {
-        running->state = BLOCKED;
-        tbj->tid_blocking = (int)running->tid;
-        uthread_yield();
+    /* Allocate stack */
+    tcb->stack = uthread_ctx_alloc_stack();
+    if (tcb->stack == NULL) {
+        free(tcb);
+        preempt_enable();
+        return -1;
     }
 
-    return EXIT_SUCCESS;
+    /* Initialize context */
+    if (uthread_ctx_init(&tcb->context, tcb->stack, func, arg) < 0) {
+        uthread_ctx_destroy_stack(tcb->stack);
+        free(tcb);
+        preempt_enable();
+        return -1;
+    }
+
+    /* Set thread as ready and add to ready queue */
+    tcb->state = READY;
+    if (queue_enqueue(ready_queue, tcb) < 0) {
+        uthread_ctx_destroy_stack(tcb->stack);
+        free(tcb);
+        preempt_enable();
+        return -1;
+    }
+
+    /* Re-enable preemption */
+    preempt_enable();
+    return 0;
+}
+
+int uthread_run(bool preempt, uthread_func_t func, void *arg)
+{
+    /* Create ready queue */
+    ready_queue = queue_create();
+    if (ready_queue == NULL)
+        return -1;
+
+    /* Create idle thread (main thread becomes idle thread) */
+    idle_thread = malloc(sizeof(struct uthread_tcb));
+    if (idle_thread == NULL) {
+        queue_destroy(ready_queue);
+        return -1;
+    }
+
+    /* Initialize idle thread */
+    idle_thread->state = RUNNING;
+    running_thread = idle_thread;
+
+    /* Start preemption if requested */
+    preempt_start(preempt);
+
+    /* Create initial thread */
+    if (uthread_create(func, arg) < 0) {
+        queue_destroy(ready_queue);
+        free(idle_thread);
+        preempt_stop();
+        return -1;
+    }
+
+    /* Run scheduling loop until all threads complete */
+    while (queue_length(ready_queue) > 0)
+        uthread_yield();
+
+    /* Cleanup */
+    free(idle_thread);
+    queue_destroy(ready_queue);
+    preempt_stop();
+
+    return 0;
+}
+
+void uthread_block(void)
+{
+    /* Disable preemption */
+    preempt_disable();
+
+    /* Mark thread as blocked */
+    running_thread->state = BLOCKED;
+
+    /* Schedule next thread */
+    uthread_schedule();
+
+    /* Re-enable preemption */
+    preempt_enable();
+}
+
+void uthread_unblock(struct uthread_tcb *uthread)
+{
+    /* Sanity check */
+    if (uthread == NULL)
+        return;
+
+    /* Disable preemption */
+    preempt_disable();
+
+    /* Only unblock if thread is in BLOCKED state */
+    if (uthread->state == BLOCKED) {
+        uthread->state = READY;
+        queue_enqueue(ready_queue, uthread);
+    }
+
+    /* Re-enable preemption */
+    preempt_enable();
 }

@@ -1,21 +1,26 @@
-# File: libuthread/Makefile
-
 CC = gcc
-AR = ar
-CFLAGS = -Wall -Werror -g
-ARFLAGS = rcs
+CFLAGS = -Wall -Wextra -Werror -MMD
+CFLAGS += -g  # Add debugging info
 
-LIBRARY = libuthread.a
-OBJS = queue.o
+# List object files
+OBJS = queue.o uthread.o sem.o preempt.o
 
-# Default target
-all: $(LIBRARY)
+# Include dependencies
+-include $(OBJS:.o=.d)
 
-$(LIBRARY): $(OBJS)
-	$(AR) $(ARFLAGS) $@ $^
+# Default rule
+all: libuthread.a
 
+# Rule to make the library
+libuthread.a: $(OBJS)
+	ar rcs $@ $^
+
+# Generic rule for object files
 %.o: %.c
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) -c -o $@ $
 
+# Clean up
 clean:
-	rm -f *.o $(LIBRARY)
+	rm -f $(OBJS) $(OBJS:.o=.d) libuthread.a
+
+.PHONY: clean all
